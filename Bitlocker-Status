@@ -1,0 +1,147 @@
+#=============================================================================================================================
+#
+# Script Name:     Detect_Bitlocker-Status - Intune
+# Description:     Detect script for Bitlocker to return the status. Returned are : Method, Percentage Complete, Volume Status and Protection Status.
+#                  Also checks for the TPM present and ready and if there is a keyprotectortytype for the volume.
+#
+#=============================================================================================================================
+try
+{
+    $LocalVolumes = @(Get-Volume | Where-Object {$_.DriveLetter -ne $null -and $_.DriveType -eq 'Fixed'} | Select-Object -ExpandProperty DriveLetter | ForEach-Object {Get-BitLockerVolume -MountPoint $_ -ErrorAction SilentlyContinue | Select-Object *})
+
+    foreach($Volume in $LocalVolumes)
+    {
+        if($Volume.MountPoint -eq "C:")
+        {
+            $EncMethod = $Volume.EncryptionMethod
+            $EncPercnt = $Volume.EncryptionPercentage
+            $EncVolume = $Volume.VolumeStatus
+            $EncStatus = $Volume.ProtectionStatus
+
+            if(($Volume.KeyProtector.KeyProtectorType).count -eq 2)
+            {
+                $keyProtType = $Volume.KeyProtector.KeyProtectorType[0].ToString() + ";" + $Volume.KeyProtector.KeyProtectorType[1].ToString()
+            }
+            elseif(($Volume.KeyProtector.KeyProtectorType).count -eq 1)
+            {
+                $keyProtType = $Volume.KeyProtector.KeyProtectorType.ToString()
+            }
+            else
+            {
+                $keyProtType = "unknown"
+            }
+        }
+    }
+
+    $RPID = (Get-BitLockerVolume -MountPoint $Volume.MountPoint).KeyProtector | Where-Object {$_.KeyProtectorType -eq 'RecoveryPassword'} | Select-Object -ExpandProperty KeyProtectorId
+    $TPMPresent = (Get-Tpm).TPMPresent
+    $TPMReady = (get-tpm).TPMReady
+
+    if([string]::IsNullOrEmpty($RPID)){ $RPresent = "No"} else { $RPresent = "Yes" }
+    if([string]::IsNullOrEmpty($TPMPresent)){ $TPPresent = "No"} else { $TPPresent = $TPMPresent }
+    if([string]::IsNullOrEmpty($TPMReady)){ $TPReady = "No"} else { $TPReady = $TPMReady }
+
+    If($LocalVolumes.Count -eq 1)
+    {
+
+        if($EncStatus -eq "Off")
+		{
+			write-host "Invalid Status: Percentage/$EncPercnt - ProtectStatus/$EncStatus - ProtectionType/$KeyProtType - RecoveryKey/$RPresent - TPMPresent/$TPPresent - TPMReady/$TPReady"
+			exit 1
+        }
+		elseif($EncMethod -ne 'XtsAes256')
+        {
+			write-host "Invalid Method: Method/$EncMethod - Percent/$EncPercnt - VolumeStatus/$EncVolume ProtectStatus/$EncStatus - ProtectionType/$KeyProtType - RecoveryKey/$RPresent - TPMPresent/$TPPresent TPMReady/$TPReady"
+            exit 1          
+        }
+        elseif($keyProtType.Split(";") -notcontains 'RecoveryPassword')
+        {
+            write-host "No Recovery Password: ProtectionType/$KeyProtType -  Method/$EncMethod - Percent/$EncPercnt - VolumeStatus/$EncVolume ProtectStatus/$EncStatus - RecoveryKey/$RPresent - TPMPresent/$TPPresent TPMReady/$TPReady"
+            exit 1
+        }
+        elseif($TPMPresent -eq $false)
+        {
+            write-host "No TPM Chip present cannot remediate"
+            exit 0
+        }
+		else
+        {
+			write-host "Healthy - Method: $EncMethod - Percentage: $EncPercnt - VolumeStatus: $EncVolume - ProtectStatus: $EncStatus - ProtectionType: $KeyProtType - RecoveryKey: $RPresent - TPM Present: $TPPresent - TPM Ready: $TPReady"
+			exit 0
+		}
+    }
+    else
+    {
+        Write-host $LocalVolumes.Count " bitlocker enabled volumes found. Not yet implemented" 
+        exit 0
+    }
+}
+Catch
+{
+    Write-host "$Error"
+    exit 0
+}
+
+#REMEDIATION SCRIPT
+#=============================================================================================================================
+#
+# Script Name:     Remediate_Bitlocker_EncryptionMethod
+# Description:     Remediate script for Bitlocker to fix an unwanted status.
+#
+#=============================================================================================================================
+try
+{
+    $LocalVolumes = @(Get-Volume | Where-Object {$_.DriveLetter -ne $null -and $_.DriveType -eq 'Fixed'} | Select-Object -ExpandProperty DriveLetter | ForEach-Object {Get-BitLockerVolume -MountPoint $_ -ErrorAction SilentlyContinue | Select-Object *})
+    foreach($Volume in $LocalVolumes)
+    {
+        if($Volume.MountPoint -eq "C:")
+        {
+            $EncMethod = $Volume.EncryptionMethod
+            $EncPercnt = $Volume.EncryptionPercentage
+            $EncVolume = $Volume.VolumeStatus
+            $EncStatus = $Volume.ProtectionStatus
+            $EncKeyProt = $Volume.KeyProtector
+
+            If ($EncKeyProt.KeyProtectorType -notcontains 'RecoveryPassword')
+            {
+                try
+                {
+                    Enable-BitLocker -MountPoint $Volume.MountPoint -TpmProtector -ErrorAction SilentlyContinue
+                    Enable-BitLocker -MountPoint $Volume.MountPoint -EncryptionMethod XtsAes256 -UsedSpaceOnly -SkipHardwareTest -RecoveryPasswordProtector -ErrorAction Stop | Out-Null
+                    Resume-BitLocker -MountPoint $Volume.MountPoint -ErrorAction SilentlyContinue
+                    $RPID = (Get-BitLockerVolume -MountPoint $Volume.MountPoint).KeyProtector | Where-Object {$_.KeyProtectorType -eq 'RecoveryPassword'} | Select-Object -ExpandProperty KeyProtectorId
+                    BackupToAAD-BitLockerKeyProtector -MountPoint $Volume.MountPoint -KeyProtectorId $RPID -ErrorAction Stop
+                }
+                catch
+                {
+                    Write-host "Encryption action for RecoveryPassword failed. $($_.Exception.GetType().FullName), $($_.Exception.Message)"
+                }
+            }
+
+
+            # Remediate ProtectStatus: Off
+            if($EncStatus -eq "off" -and $EncPercnt -eq 100)
+            {
+                try
+               {
+                    manage-bde -protectors -enable $Volume.MountPoint
+        #            Start-Process -NoNewWindow -FilePath "manage-bde" -ArgumentList "-protectors -enable $Volume.MountPoint" -Wait
+                    write-host "Turned Protection satus on for volume "$Volume.MountPoint
+                    Exit 0
+                }
+                catch
+                {
+                    write-host "Turning Protection on failed."
+                    exit 1
+                }
+            }
+        }
+    }
+    write-host "Method: $EncMethod - Percentage: $EncPercnt - VolumeStatus: $EncVolume - ProtectStatus: $EncStatus"
+    exit 0
+}
+Catch
+{
+    Write-host "Remediation Failed"
+    exit 1
+}
